@@ -174,27 +174,30 @@ public abstract class AiServices<T> {
     }
 
     /**
-     * Creates an AI Service (an implementation of the provided interface), that is backed by the provided streaming chat model.
-     * This convenience method can be used to create simple AI Services.
-     * For more complex cases, please use {@link #builder}.
+     * 基于流式聊天模型创建 AI Service（即传入接口的运行时实现）。
+     * 这是便捷入口，适合快速接入；复杂场景请使用 {@link #builder} 进行细粒度配置。
      *
-     * @param aiService          The class of the interface to be implemented.
-     * @param streamingChatModel The streaming chat model to be used under the hood.
-     *                           The return type of all methods should be {@link TokenStream}.
-     * @return An instance of the provided interface, implementing all its defined methods.
+     * @param aiService          需要由框架实现的业务接口类型
+     * @param streamingChatModel 底层使用的流式聊天模型；接口方法通常应返回 {@link TokenStream}
+     * @param <T>                业务接口类型
+     * @return 业务接口的动态代理实例
      */
     public static <T> T create(Class<T> aiService, StreamingChatModel streamingChatModel) {
+        // 先进入统一 builder 流程，保证静态快捷入口与手动 builder 行为一致。
         return builder(aiService).streamingChatModel(streamingChatModel).build();
     }
 
     /**
-     * Begins the construction of an AI Service.
+     * 开始构建 AI Service。
      *
-     * @param aiService The class of the interface to be implemented.
-     * @return builder
+     * @param aiService 需要由框架实现的业务接口类型
+     * @param <T>       业务接口类型
+     * @return AI Service 构建器
      */
     public static <T> AiServices<T> builder(Class<T> aiService) {
+        // 先把接口类型封装为上下文，后续所有配置与校验都依赖该上下文对象。
         AiServiceContext context = AiServiceContext.create(aiService);
+        // 继续委托给上下文版 builder，避免两套构建逻辑分叉。
         return builder(context);
     }
 
@@ -202,10 +205,19 @@ public abstract class AiServices<T> {
         private static final AiServicesFactory aiServicesFactory = loadFactory(AiServicesFactory.class);
     }
 
+    /**
+     * 使用内部上下文创建 AI Service 构建器。
+     *
+     * @param context AI Service 运行上下文
+     * @param <T>     业务接口类型
+     * @return 具体的 AI Service 构建器实现
+     */
     @Internal
     public static <T> AiServices<T> builder(AiServiceContext context) {
+        // 若外部通过 SPI 提供了工厂，则优先使用外部实现，便于替换默认行为。
         return FactoryHolder.aiServicesFactory != null
                 ? FactoryHolder.aiServicesFactory.create(context)
+                // 没有 SPI 扩展时回退到内置默认实现。
                 : new DefaultAiServices<>(context);
     }
 

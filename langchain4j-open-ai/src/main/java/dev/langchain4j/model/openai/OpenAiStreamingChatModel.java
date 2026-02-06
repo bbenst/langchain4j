@@ -135,12 +135,20 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
         return defaultRequestParameters;
     }
 
+    /**
+     * 执行一次 OpenAI 流式聊天请求，并将增量事件转发给上层处理器。
+     *
+     * @param chatRequest 上层组装后的聊天请求
+     * @param handler     流式响应处理器
+     */
     @Override
     public void doChat(ChatRequest chatRequest, StreamingChatResponseHandler handler) {
 
+        // 将通用参数视图收敛为 OpenAI 参数类型，并执行参数合法性校验。
         OpenAiChatRequestParameters parameters = (OpenAiChatRequestParameters) chatRequest.parameters();
         validate(parameters);
 
+        // 强制开启 stream 并请求 usage，确保上层可以接收增量内容与完整统计信息。
         ChatCompletionRequest openAiRequest =
                 toOpenAiChatRequest(
                                 chatRequest, parameters, sendThinking, thinkingFieldName, strictTools, strictJsonSchema)
@@ -149,80 +157,106 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
                                 StreamOptions.builder().includeUsage(true).build())
                         .build();
 
+        // 负责把每个增量片段聚合为最终 ChatResponse。
         OpenAiStreamingResponseBuilder openAiResponseBuilder = new OpenAiStreamingResponseBuilder(returnThinking);
+        // 负责增量拼接工具调用参数，支持 partial tool call 到 complete tool call 的转换。
         ToolCallBuilder toolCallBuilder = new ToolCallBuilder();
 
+        // 发起 OpenAI 流式请求，并注册 partial/complete/error 三类回调。
         client.chatCompletion(openAiRequest)
                 .onRawPartialResponse(parsedAndRawResponse -> {
+                    // 每个分片都先累计，再拆分为文本/thinking/tool-call 事件回调给上层 handler。
                     openAiResponseBuilder.append(parsedAndRawResponse);
                     handle(parsedAndRawResponse, toolCallBuilder, handler);
                 })
                 .onComplete(() -> {
+                    // 若流结束时仍有未封口的工具调用参数，这里补发 complete tool call。
                     if (toolCallBuilder.hasRequests()) {
                         onCompleteToolCall(handler, toolCallBuilder.buildAndReset());
                     }
 
+                    // 流结束后统一构建完整响应，保证元数据和聚合文本一致。
                     ChatResponse completeResponse = openAiResponseBuilder.build();
                     onCompleteResponse(handler, completeResponse);
                 })
                 .onError(throwable -> {
+                    // 统一异常映射，减少上层对底层 HTTP/SDK 异常类型的感知成本。
                     RuntimeException mappedException = ExceptionMapper.DEFAULT.mapException(throwable);
+                    // 包裹执行避免 handler 自身异常打断错误回调链路。
                     withLoggingExceptions(() -> handler.onError(mappedException));
                 })
                 .execute();
     }
 
+    /**
+     * 处理一次 OpenAI 流式分片响应，将可消费的增量内容转发给上层处理器。
+     *
+     * @param parsedAndRawResponse 当前分片的解析结果与原始流上下文
+     * @param toolCallBuilder      工具调用增量聚合器，用于拼接跨分片参数
+     * @param handler              流式响应处理器
+     */
     private void handle(
             ParsedAndRawResponse<ChatCompletionResponse> parsedAndRawResponse,
             ToolCallBuilder toolCallBuilder,
             StreamingChatResponseHandler handler) {
+        // OpenAI 流分片可能包含 keep-alive 或非业务片段，先做空值短路避免后续空指针与误回调。
         ChatCompletionResponse partialResponse = parsedAndRawResponse.parsedResponse();
         if (partialResponse == null) {
             return;
         }
 
+        // 仅处理首个 choice 的增量语义；空 choices 说明该分片没有可下发的模型内容。
         List<ChatCompletionChoice> choices = partialResponse.choices();
         if (isNullOrEmpty(choices)) {
             return;
         }
 
+        // 对单个 choice 再次做防御式校验，兼容服务端异常分片结构。
         ChatCompletionChoice chatCompletionChoice = choices.get(0);
         if (chatCompletionChoice == null) {
             return;
         }
 
+        // delta 才承载真正的增量字段（文本、推理、工具调用）；缺失时直接忽略该分片。
         Delta delta = chatCompletionChoice.delta();
         if (delta == null) {
             return;
         }
 
+        // 增量文本按分片立即透传，保证调用方能够实时渲染模型输出。
         String content = delta.content();
         if (!isNullOrEmpty(content)) {
             onPartialResponse(handler, content, parsedAndRawResponse.streamingHandle());
         }
 
+        // 仅在显式开启 returnThinking 时回传推理内容，避免默认泄露中间推理信息。
         String reasoningContent = delta.reasoningContent();
         if (returnThinking && !isNullOrEmpty(reasoningContent)) {
             onPartialThinking(handler, reasoningContent, parsedAndRawResponse.streamingHandle());
         }
 
+        // 工具调用参数通常会跨多个分片返回，需逐片拼接并按 index 边界输出完整调用。
         List<ToolCall> toolCalls = delta.toolCalls();
         if (toolCalls != null) {
             for (ToolCall toolCall : toolCalls) {
 
+                // index 变化代表进入新的工具调用；先冲刷上一个调用，避免参数串到下一个调用中。
                 int index = toolCall.index();
                 if (toolCallBuilder.index() != index) {
                     onCompleteToolCall(handler, toolCallBuilder.buildAndReset());
                     toolCallBuilder.updateIndex(index);
                 }
 
+                // id/name 可能在首片或后续片补齐，统一通过 builder 做“有值即更新”式聚合。
                 String id = toolCallBuilder.updateId(toolCall.id());
                 String name = toolCallBuilder.updateName(toolCall.function().name());
 
+                // 仅当本分片携带 arguments 增量时才追加并下发 partial 事件，降低无效事件噪音。
                 String partialArguments = toolCall.function().arguments();
                 if (isNotNullOrEmpty(partialArguments)) {
                     toolCallBuilder.appendArguments(partialArguments);
 
+                    // partial tool call 只包含本片新增参数，调用方可用于流式展示或实时调试。
                     PartialToolCall partialToolRequest = PartialToolCall.builder()
                             .index(index)
                             .id(id)
