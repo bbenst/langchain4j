@@ -64,6 +64,7 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
     private final boolean returnThinking;
     private final boolean sendThinking;
     private final String thinkingFieldName;
+    private final boolean accumulateToolCallId;
     private final List<ChatModelListener> listeners;
 
     public OpenAiStreamingChatModel(OpenAiStreamingChatModelBuilder builder) {
@@ -127,6 +128,7 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
         this.returnThinking = getOrDefault(builder.returnThinking, false);
         this.sendThinking = getOrDefault(builder.sendThinking, false);
         this.thinkingFieldName = getOrDefault(builder.thinkingFieldName, "reasoning_content");
+        this.accumulateToolCallId = getOrDefault(builder.accumulateToolCallId, true);
         this.listeners = copy(builder.listeners);
     }
 
@@ -151,14 +153,14 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
         // 强制开启 stream 并请求 usage，确保上层可以接收增量内容与完整统计信息。
         ChatCompletionRequest openAiRequest =
                 toOpenAiChatRequest(
-                                chatRequest, parameters, sendThinking, thinkingFieldName, strictTools, strictJsonSchema)
+                        chatRequest, parameters, sendThinking, thinkingFieldName, strictTools, strictJsonSchema)
                         .stream(true)
                         .streamOptions(
                                 StreamOptions.builder().includeUsage(true).build())
                         .build();
 
+        OpenAiStreamingResponseBuilder openAiResponseBuilder = new OpenAiStreamingResponseBuilder(returnThinking, accumulateToolCallId);
         // 负责把每个增量片段聚合为最终 ChatResponse。
-        OpenAiStreamingResponseBuilder openAiResponseBuilder = new OpenAiStreamingResponseBuilder(returnThinking);
         // 负责增量拼接工具调用参数，支持 partial tool call 到 complete tool call 的转换。
         ToolCallBuilder toolCallBuilder = new ToolCallBuilder();
 
@@ -318,6 +320,7 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
         private Boolean returnThinking;
         private Boolean sendThinking;
         private String thinkingFieldName;
+        private Boolean accumulateToolCallId;
         private Duration timeout;
         private Boolean logRequests;
         private Boolean logResponses;
@@ -531,6 +534,26 @@ public class OpenAiStreamingChatModel implements StreamingChatModel {
         public OpenAiStreamingChatModelBuilder sendThinking(Boolean sendThinking) {
             this.sendThinking = sendThinking;
             this.thinkingFieldName = "reasoning_content";
+            return this;
+        }
+
+        /**
+         * Controls whether to accumulate tool call IDs in streaming responses.
+         * <p>
+         * This setting is useful when using OpenAI-compatible APIs (like DeepSeek or Qwen) that send
+         * the complete tool call ID in every streaming chunk, rather than sending it incrementally.
+         * <p>
+         * Enabled by default (true) for standard OpenAI behavior.
+         * Set to false for APIs like DeepSeek/Qwen that repeat the full ID in each chunk.
+         * <p>
+         * When enabled (true): IDs are accumulated across chunks (e.g., "abc" + "def" = "abcdef")
+         * When disabled (false): Each chunk's ID replaces the previous one (e.g., "abc" -> "abc")
+         *
+         * @param accumulateToolCallId whether to accumulate tool call IDs
+         * @return {@code this}
+         */
+        public OpenAiStreamingChatModelBuilder accumulateToolCallId(Boolean accumulateToolCallId) {
+            this.accumulateToolCallId = accumulateToolCallId;
             return this;
         }
 
